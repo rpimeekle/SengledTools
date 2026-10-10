@@ -26,12 +26,16 @@ def get_mac_address(ip: Optional[str] = None, interface: Optional[str] = None) -
     """Get MAC address using psutil (cross-platform, more reliable than getmac).
     
     Args:
-        ip: IP address to find MAC for (not fully supported, use interface instead)
+        ip: Remote IP address to look up in the ARP table (e.g. the bulb's AP address)
         interface: Network interface name (e.g., 'eth0', 'wlan0')
-    
+
     Returns:
         MAC address string or None if not found
     """
+    if ip:
+        # Look up the remote device's MAC in the ARP table; never fall back to a local adapter MAC
+        return _lookup_arp_mac(ip)
+
     try:
         import psutil
         
@@ -52,6 +56,41 @@ def get_mac_address(ip: Optional[str] = None, interface: Optional[str] = None) -
         return None
     except ImportError:
         return None
+
+def _lookup_arp_mac(ip: str) -> Optional[str]:
+    """Return the MAC for `ip` from the system ARP table, or None if not present."""
+    import subprocess
+
+    mac_re = re.compile(r"([0-9A-Fa-f]{1,2}[:-]){5}[0-9A-Fa-f]{1,2}")
+    ip_re = re.compile(rf"(?<![\d.]){re.escape(ip)}(?![\d.])")  # avoid 192.168.8.1 matching 192.168.8.10
+    # Linux exposes the table directly
+    try:
+        with open("/proc/net/arp") as f:
+            for line in f.readlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 4 and parts[0] == ip and parts[3] != "00:00:00:00:00:00":
+                    return normalize_mac_address(parts[3])
+    except OSError:
+        pass
+
+    # Windows (`arp -a <ip>`) and macOS (`arp -n <ip>`)
+    for cmd in (["arp", "-a", ip], ["arp", "-n", ip]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in out.splitlines():
+            if not ip_re.search(line):
+                continue
+            m = mac_re.search(line)
+            if m:
+                # macOS may print unpadded octets (e.g. b0:f8:93:0:1:2)
+                octets = re.split(r"[:-]", m.group(0))
+                try:
+                    return normalize_mac_address("".join(o.zfill(2) for o in octets))
+                except ValueError:
+                    continue
+    return None
 
 def get_config_dir() -> Path:
     """Gets the configuration directory for the application."""
