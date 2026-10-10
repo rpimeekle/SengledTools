@@ -4,9 +4,9 @@
   "codeowners": ["@samfundev"],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/HamzaETTH/SengledTools",
-  "iot_class": "local_push",
-  "issue_tracker": "https://github.com/HamzaETTH/SengledTools/issues",
+  "documentation": "https://github.com/rpimeekle/SengledTools",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/rpimeekle/SengledTools/issues",
   "requirements": [],
-  "version": "1.0.0"
+  "version": "1.1.0"
 }
