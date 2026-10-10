@@ -173,6 +173,7 @@ def run_wifi_setup(
 					s.sendto(json.dumps(start_req).encode("utf-8"), (BULB_IP, BULB_PORT))
 					data, _ = s.recvfrom(4096)
 					handshake_resp = json.loads(data.decode("utf-8"))
+					debug(f"Handshake response from bulb: {json.dumps(handshake_resp)}")
 
 					if "mac" not in handshake_resp.get("payload", {}) and getattr(args, 'mac', None):
 						say("MAC address not provided by bulb, using command line option --mac")
@@ -234,7 +235,7 @@ def run_wifi_setup(
 									info(
 										"If you are running a custom broker, use the --broker-ip and --broker-port arguments."
 									)
-									return None, None
+									return None, None, None
 
 					if setup_server and setup_server.active:
 						info("HTTP server is already running (this session).")
@@ -435,9 +436,20 @@ def run_wifi_setup(
 							response_json = json.loads(response_str)
 							if interactive:
 								debug("Parsed response as plaintext JSON.")
+							if response_json.get("result", {}).get("msg") == "function not find":
+								# Some firmware can't parse the RC4 payload; retry with plaintext JSON
+								warn_("Bulb did not understand the encrypted request; retrying unencrypted...")
+								s.sendto(json.dumps(start_req).encode("utf-8"), (BULB_IP, BULB_PORT))
+								s.recvfrom(4096)
+								s.sendto(json.dumps(params_payload).encode("utf-8"), (BULB_IP, BULB_PORT))
+								data, _ = s.recvfrom(4096)
+								response_str = data.decode("utf-8")
+								if interactive:
+									debug(f"Received raw response from bulb:\n{response_str}")
+								response_json = json.loads(response_str)
 							if response_json.get("payload", {}).get("result") is not True:
 								warn_("Bulb rejected credentials (plaintext error).")
-								return None, None
+								return None, None, None
 						except json.JSONDecodeError:
 							# If JSON parsing fails, assume it's encrypted
 							if interactive:
@@ -447,7 +459,7 @@ def run_wifi_setup(
 								debug(f"Decrypted response:\n{json.dumps(decrypted_resp, indent=2)}")
 							if not isinstance(decrypted_resp, dict) or not decrypted_resp.get("payload", {}).get("result"):
 								warn_("Bulb rejected credentials (decryption failed).")
-								return None, None
+								return None, None, None
 					except socket.timeout:
 						pass  # Timeout is expected here
 

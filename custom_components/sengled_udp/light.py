@@ -3,6 +3,7 @@ import json
 import logging
 import socket
 import time
+from datetime import timedelta
 from typing import Any, Dict, Optional, Tuple
 
 from homeassistant.components.light import (
@@ -15,8 +16,16 @@ from homeassistant.components.light import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 
 _LOGGER = logging.getLogger(__name__)
+
+# Poll often enough to pick up changes made outside HA (e.g. via sengled_tool.py)
+SCAN_INTERVAL = timedelta(seconds=10)
+# UDP is lossy; only mark the bulb unavailable after this many unanswered polls in a row
+MAX_MISSED_POLLS = 2
+# Re-read state this long after a command (must exceed the 2s stale-state debounce)
+VERIFY_DELAY_SEC = 3.0
 
 async def async_setup_entry(
         hass: HomeAssistant,
@@ -91,6 +100,8 @@ class SengledLight(LightEntity):
 
         self._attr_color_mode = ColorMode.RGB
         self._available = True
+        self._missed_polls = 0
+        self._cancel_verify = None
         self._optimistic_power = False
 
         if host_type == "rgb":
@@ -118,6 +129,10 @@ class SengledLight(LightEntity):
         self._attr_max_color_temp_kelvin = 6500
 
     @property
+    def available(self) -> bool:
+        return self._available
+
+    @property
     def is_on(self) -> bool:
         return self._attr_is_on
 
@@ -143,11 +158,18 @@ class SengledLight(LightEntity):
             return
 
         status = await self._get_device_status()
-        if status:
-            if self._is_rgb is None:
-                self._detect_capabilities(status)
-            brightness_info = await self._get_device_brightness()
-            self._update_state_from_status(status, brightness_info)
+        if not status:
+            self._missed_polls += 1
+            if self._missed_polls >= MAX_MISSED_POLLS and self._available:
+                _LOGGER.warning("Sengled bulb %s is not responding", self._host)
+                self._available = False
+            return
+
+        self._missed_polls = 0
+        if self._is_rgb is None:
+            self._detect_capabilities(status)
+        brightness_info = await self._get_device_brightness()
+        self._update_state_from_status(status, brightness_info)
 
     def _detect_capabilities(self, status: Dict[str, Any]) -> None:
         has_rgb = "R" in status and "G" in status and "B" in status
@@ -209,35 +231,71 @@ class SengledLight(LightEntity):
         self._attr_is_on = True
         self._last_req_time = time.time()
 
+        responses = []
         if ATTR_BRIGHTNESS in kwargs and brightness_percent is not None:
-            await self._send_command(
+            responses.append(await self._send_command(
                 "set_device_brightness", {"brightness": brightness_percent}
-            )
+            ))
 
         if ATTR_COLOR_TEMP_KELVIN in kwargs and device_temp is not None:
-            await self._send_command(
+            responses.append(await self._send_command(
                 "set_device_colortemp", {"colorTemperature": device_temp}
-            )
+            ))
 
         if ATTR_RGB_COLOR in kwargs and rgb is not None:
-            await self._send_command(
+            responses.append(await self._send_command(
                 "set_device_color", {"red": rgb[0], "green": rgb[1], "blue": rgb[2]}
-            )
+            ))
 
         # Turn on the light
         if ATTR_COLOR_TEMP_KELVIN not in kwargs and ATTR_RGB_COLOR not in kwargs:
-            await self._send_command("set_device_switch", {"switch": 1})
+            responses.append(await self._send_command("set_device_switch", {"switch": 1}))
 
+        self._check_command_responses(responses)
         self.async_write_ha_state()
+        self._schedule_verify()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the light."""
         self._attr_is_on = False
         self._last_req_time = time.time()
 
-        await self._send_command("set_device_switch", {"switch": 0})
+        response = await self._send_command("set_device_switch", {"switch": 0})
 
+        self._check_command_responses([response])
         self.async_write_ha_state()
+        self._schedule_verify()
+
+    def _check_command_responses(self, responses: list) -> None:
+        """Mark the bulb unavailable if it acknowledged none of the commands we sent."""
+        if responses and all(r is None for r in responses):
+            _LOGGER.warning("Sengled bulb %s did not acknowledge the command", self._host)
+            self._available = False
+            return
+        self._available = True
+        for r in responses:
+            result = (r or {}).get("result", {})
+            if r is not None and result.get("ret") != 0:
+                _LOGGER.warning(
+                    "Sengled bulb %s rejected %s: %s", self._host, r.get("func"), result.get("msg")
+                )
+
+    def _schedule_verify(self) -> None:
+        """Re-read the bulb's real state shortly after a command, replacing the optimistic state."""
+        if self._cancel_verify:
+            self._cancel_verify()
+
+        async def _verify(_now) -> None:
+            self._cancel_verify = None
+            await self.async_update()
+            self.async_write_ha_state()
+
+        self._cancel_verify = async_call_later(self.hass, VERIFY_DELAY_SEC, _verify)
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._cancel_verify:
+            self._cancel_verify()
+            self._cancel_verify = None
 
     async def _get_device_status(self) -> Optional[Dict[str, Any]]:
         response = await self._send_command("search_devices", {})
