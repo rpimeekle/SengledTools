@@ -1,7 +1,7 @@
 {
   "domain": "sengled_udp",
   "name": "Sengled UDP",
-  "codeowners": ["@samfundev"],
+  "codeowners": ["@samfundev", "@rpimeekle"],
   "config_flow": true,
   "dependencies": [],
   "documentation": "https://github.com/rpimeekle/SengledTools",
